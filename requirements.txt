@@ -1,0 +1,19 @@
+torch==2.1.0+cu118
+torchvision==0.16.0+cu118
+# SDv1.5 and AnimateDiff-Lightning
+diffusers==0.32.1
+transformers==4.46.3
+accelerate==1.0.1
+# ModelScope dependencies
+modelscope==1.4.2
+pytorch-lightning
+open_clip_torch==2.24.0
+tensorflow==2.13.0
+opencv-python
+# LaVie dependencies
+ninja
+xformers==0.0.20
+imageio==2.31.1
+imageio-ffmpeg==0.4.9
+omegaconf==2.3.0
+rotary_embedding_torch
