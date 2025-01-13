@@ -1,7 +1,9 @@
 import torch
-from diffusers import StableDiffusionPipeline, AnimateDiffPipeline
+from torchvision import transforms
+from diffusers import StableDiffusionPipeline, AnimateDiffPipeline, pipelines
 from diffusers import MotionAdapter, EulerDiscreteScheduler
 from diffusers.utils import export_to_gif
+import modelscope
 from modelscope.pipelines import pipeline
 from modelscope.outputs import OutputKeys
 from huggingface_hub import hf_hub_download
@@ -11,6 +13,8 @@ from safetensors.torch import load_file
 CONTROL_CLS  = AnimateDiffPipeline
 SPATIAL_CLS  = StableDiffusionPipeline
 TEMPORAL_CLS = pipeline
+OUTVIDEO_CLS = pipelines.animatediff.pipeline_output.AnimateDiffPipelineOutput
+TEMPORAL_MODEL_CLS = modelscope.models.multi_modal.video_synthesis.text_to_video_synthesis_model.TextToVideoSynthesis
 
 class ConFiner:
     def __init__(
@@ -22,10 +26,12 @@ class ConFiner:
             dtype = torch.float16,
             device = "cuda",
             step = 4,  # Options: [1,2,4,8]
+            guidance_scale = 1.,
         ):
         self.step = step
         self.device = device
         self.dtype = dtype
+        self.guidance_scale = guidance_scale
 
         self.motion_adapter = MotionAdapter().to(device, dtype)
         self.motion_adapter.load_state_dict(
@@ -70,16 +76,34 @@ class ConFiner:
         )
         return self.coarse_video
 
-    def generate_video_structure(self, coarse_video, noisy_steps=50):
+    def generate_video_structure(self, coarse_video=None, noisy_steps=4):
         """
         使用control expert生成video structure
         :param coarse_video: 输入的coarse video
         :param num_steps: 生成的步数
         :return: 生成的video structure
         """
-        self.video_structure = self.control_expert.add_noise(
+        assert noisy_steps <= self.step, "noisy_steps should be less than or equal to step"
+        num_steps = self.control_expert.scheduler.timesteps[self.step-noisy_steps]
+
+        assert coarse_video is None or isinstance(coarse_video, OUTVIDEO_CLS), \
+            "invalid coarse video type: None or PIL Image"
+        if coarse_video is None:
+            coarse_video = self.coarse_video
+
+        # transform PIL.Image.Image to torch.Tensor        
+        coarse_video = [transforms.ToTensor()(pil).unsqueeze(0) for pil in coarse_video.frames[0]]
+        # concatenate along the time dimension
+        coarse_video = torch.cat(coarse_video, dim=0)
+
+        # sample normal noise
+        noise = torch.randn_like(coarse_video)
+
+        # add noise to the coarse video
+        self.video_structure = self.control_expert.scheduler.add_noise(
             coarse_video, 
-            noisy_steps
+            noise,
+            num_steps
         )
         return self.video_structure
 
@@ -101,15 +125,69 @@ class ConFiner:
         for step in range(num_refinements):
             if coordinate_flag:
                 # coordinated denoising
-                video = self.spatial_expert.denoise( video, step, prompt)
-                video = self.temporal_expert.add_noise(video, step)
-                video = self.temporal_expert.denoise(video, step, prompt)
-                video = self.spatial_expert.add_noise( video, step)
-                video = self.spatial_expert.denoise( video, step, prompt)
+                video = self.spatial_expert(
+                    prompt = prompt, 
+                    guidance_scale = self.guidance_scale, 
+                    num_inference_steps = step
+                )
+                # add-denoise loop - temporal
+                video = self._q_sample(
+                    model = self.temporal_expert.model, 
+                    x_start = video, 
+                    timestep = step
+                )
+                video = self.temporal_expert(prompt)
+                # add-denoise loop - spatial
+                video = self._q_sample(
+                    model = self.spatial_expert,
+                    x_start = video,
+                    timestep = step
+                )
+                video = self.spatial_expert(
+                    prompt = prompt, 
+                    guidance_scale = self.guidance_scale, 
+                    num_inference_steps = step
+                )
             else:
                 # standard denoising
-                video = self.spatial_expert.denoise(video, step)
+                video = self.spatial_expert(
+                    prompt = prompt, 
+                    guidance_scale = self.guidance_scale, 
+                    num_inference_steps = step
+                )
         return video
+    
+    def _q_sample(self, model, x_start, timestep, noise=None):
+        """
+        执行q-sample
+        :param x_start: 输入的video
+        :param timestep: 输入的时间步
+        :param noise: 输入的噪声
+        :return: q-sample后的video
+        """
+        if noise is None:
+            noise = torch.randn_like(x_start)
+
+        if isinstance(model, TEMPORAL_MODEL_CLS):
+            # get noise schedule
+            noise_schedule = model.diffusion
+            # get efficient parameters
+            sqrt_alphas_cumprod = noise_schedule.sqrt_alphas_cumprod[timestep]
+            sqrt_one_minus_alphas_cumprod = noise_schedule.sqrt_one_minus_alphas_cumprod[timestep]
+            # add noise
+            x_start_hat = sqrt_alphas_cumprod * x_start + sqrt_one_minus_alphas_cumprod * noise
+            return x_start_hat
+        elif isinstance(model, SPATIAL_CLS):
+            num_step = model.scheduler._timesteps[timestep]
+            # add noise to the coarse video
+            self.video_structure = self.control_expert.scheduler.add_noise(
+                x_start, 
+                noise,
+                num_step
+            )
+            return self.video_structure
+        else:
+            raise NotImplementedError("only support temporal diffusion model")
 
 
 if __name__ == '__main__':
