@@ -86,6 +86,9 @@ class ConFiner:
         assert noisy_steps <= self.step, "noisy_steps should be less than or equal to step"
         num_steps = self.control_expert.scheduler.timesteps[self.step-noisy_steps]
 
+        if len(num_steps.shape) < 1:
+            num_steps = torch.tensor([num_steps])
+
         assert coarse_video is None or isinstance(coarse_video, OUTVIDEO_CLS), \
             "invalid coarse video type: None or PIL Image"
         if coarse_video is None:
@@ -188,6 +191,60 @@ class ConFiner:
             return self.video_structure
         else:
             raise NotImplementedError("only support temporal diffusion model")
+
+
+    def _p_sample_from_t(self, model, x_t, t):
+        """
+        从时间步t执行p-sample
+        :param model: 输入的model
+        :param x_t: 输入的video
+        :param t: 输入的时间步
+        :return: p-sample后的video
+        """
+        if isinstance(model, TEMPORAL_MODEL_CLS):
+            # get noise schedule
+            noise_schedule = model.diffusion
+            # get efficient parameters
+            sqrt_alphas_cumprod = noise_schedule.sqrt_alphas_cumprod[t]
+            sqrt_one_minus_alphas_cumprod = noise_schedule.sqrt_one_minus_alphas_cumprod[t]
+        
+        if isinstance(model, SPATIAL_CLS):
+            timesteps = model.timesteps
+            num_inference_steps = model.num_inference_steps
+            # 7. Denoising loop
+            num_warmup_steps = len(timesteps) - num_inference_steps * model.scheduler.order
+            self._num_timesteps = len(timesteps)
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t in enumerate(timesteps):
+                    if self.interrupt:
+                        continue
+
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                    # predict the noise residual
+                    noise_pred = self.unet(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep_cond=timestep_cond,
+                        cross_attention_kwargs=self.cross_attention_kwargs,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
+
+                    # perform guidance
+                    if self.do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+                    if self.do_classifier_free_guidance and self.guidance_rescale > 0.0:
+                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                        noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
 
 
 if __name__ == '__main__':
